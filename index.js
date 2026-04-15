@@ -95,7 +95,7 @@ app.post('/webhook', async (req, res) => {
             // --- SEND REPLY VIA META API ---
             await axios({
                 method: 'POST',
-                url: `https://graph.facebook.com/v19.0/${process.env.META_PHONE_ID}/messages`,
+                url: 'https://graph.facebook.com/v25.0/${process.env.META_PHONE_ID}/messages',
                 headers: {
                     'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
                     'Content-Type': 'application/json'
