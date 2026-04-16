@@ -9,7 +9,6 @@ app.use(express.json());
 // 1. Setup Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Replace the text inside the brackets with your actual business facts
 const systemPrompt = `You are DeemWonder's customer support bot. ALWAYS keep replies under 2 sentences. 
 Business Facts:
 - We sell customized gifts across India.
@@ -23,10 +22,28 @@ const model = genAI.getGenerativeModel({
     systemInstruction: systemPrompt 
 });
 
-// 2. Memory Storage (The Brain)
+// 2. Memory & Spam Trackers
 const chatMemory = new Map();
 const memoryTimers = new Map();
-const MAX_HISTORY = 5; // Keeps the last 5 back-and-forth messages
+const spamTracker = new Map(); // Tracks message times to block spam
+const MAX_HISTORY = 5; 
+
+// Helper: Send WhatsApp Message (Saves us writing this code twice)
+async function sendWhatsAppMessage(phone, text) {
+    await axios({
+        method: 'POST',
+        url: `https://graph.facebook.com/v25.0/${process.env.META_PHONE_ID}/messages`,
+        headers: {
+            'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
+            'Content-Type': 'application/json'
+        },
+        data: {
+            messaging_product: 'whatsapp',
+            to: phone,
+            text: { body: text }
+        }
+    });
+}
 
 // 3. Meta Webhook Verification
 app.get('/webhook', (req, res) => {
@@ -43,13 +60,10 @@ app.get('/webhook', (req, res) => {
 
 // 4. Handle Incoming Messages
 app.post('/webhook', async (req, res) => {
-    // Meta requires an instant 200 OK response, or it will keep resending the message
-    res.sendStatus(200);
+    res.sendStatus(200); // Always reply 200 OK instantly to Meta
 
     try {
         const body = req.body;
-
-        // Check if it's an actual message, ignore delivery read receipts
         if (body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
             const messageData = body.entry[0].changes[0].value.messages[0];
             const senderPhone = messageData.from;
@@ -57,63 +71,66 @@ app.post('/webhook', async (req, res) => {
 
             console.log(`New message from ${senderPhone}: ${userText}`);
 
-            // --- MEMORY MANAGEMENT ---
-            // Clear the old 30-minute timer for this customer
-            if (memoryTimers.has(senderPhone)) {
-                clearTimeout(memoryTimers.get(senderPhone));
+            // --- SPAM / BURST FILTER ---
+            const now = Date.now();
+            if (!spamTracker.has(senderPhone)) spamTracker.set(senderPhone, []);
+            
+            const times = spamTracker.get(senderPhone);
+            times.push(now);
+            
+            // Keep only messages from the last 15 seconds (15000 milliseconds)
+            const recentTimes = times.filter(time => now - time < 15000);
+            spamTracker.set(senderPhone, recentTimes);
+
+            // If more than 4 messages in 15 seconds, block them
+            if (recentTimes.length > 4) {
+                console.log(`Spam blocked for ${senderPhone}`);
+                await sendWhatsAppMessage(senderPhone, "Whoa, slow down! Please wait 15 seconds before texting again.");
+                return; // Stop the code right here, don't call Gemini
             }
 
-            // Create a fresh array if this is a new customer
-            if (!chatMemory.has(senderPhone)) {
-                chatMemory.set(senderPhone, []);
-            }
+            // --- MEMORY MANAGEMENT ---
+            if (memoryTimers.has(senderPhone)) clearTimeout(memoryTimers.get(senderPhone));
+            if (!chatMemory.has(senderPhone)) chatMemory.set(senderPhone, []);
+            
             const history = chatMemory.get(senderPhone);
 
-            // --- ASK GEMINI ---
-            // Pass the chat history to Gemini so it remembers the context
-            const chat = model.startChat({ history: history });
-            const result = await chat.sendMessage(userText);
-            const aiReply = result.response.text();
+            // --- ASK GEMINI WITH ERROR HANDLING ---
+            let aiReply = "";
+            try {
+                const chat = model.startChat({ history: history });
+                const result = await chat.sendMessage(userText);
+                aiReply = result.response.text();
 
-            // Save the new back-and-forth to memory
-            history.push({ role: "user", parts: [{ text: userText }] });
-            history.push({ role: "model", parts: [{ text: aiReply }] });
+                // Only save to history if Gemini successfully replies
+                history.push({ role: "user", parts: [{ text: userText }] });
+                history.push({ role: "model", parts: [{ text: aiReply }] });
 
-            // Sliding Window: Delete oldest messages if the array gets too big
-            if (history.length > MAX_HISTORY * 2) {
-                history.splice(0, history.length - (MAX_HISTORY * 2));
+                if (history.length > MAX_HISTORY * 2) {
+                    history.splice(0, history.length - (MAX_HISTORY * 2));
+                }
+            } catch (geminiError) {
+                console.error("Gemini API overloaded:", geminiError.message);
+                aiReply = "We are getting a lot of messages right now! Give me a minute and try again.";
             }
 
-            // Set the 30-minute self-destruct timer
+            // Set memory self-destruct
             const timer = setTimeout(() => {
                 chatMemory.delete(senderPhone);
                 memoryTimers.delete(senderPhone);
+                spamTracker.delete(senderPhone);
                 console.log(`Memory cleared for ${senderPhone}`);
-            }, 30 * 60 * 1000); // 30 mins
+            }, 30 * 60 * 1000);
             memoryTimers.set(senderPhone, timer);
 
-            // --- SEND REPLY VIA META API ---
-            await axios({
-                method: 'POST',
-                url: `https://graph.facebook.com/v25.0/${process.env.META_PHONE_ID}/messages`,
-                headers: {
-                    'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
-                    'Content-Type': 'application/json'
-                },
-                data: {
-                    messaging_product: 'whatsapp',
-                    to: senderPhone,
-                    text: { body: aiReply }
-                }
-            });
-
+            // --- SEND REPLY VIA HELPER ---
+            await sendWhatsAppMessage(senderPhone, aiReply);
             console.log(`Reply sent to ${senderPhone}`);
         }
     } catch (error) {
-        console.error("Error processing message:", error?.response?.data || error.message);
+        console.error("Webhook processing error:", error?.response?.data || error.message);
     }
 });
 
-// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
