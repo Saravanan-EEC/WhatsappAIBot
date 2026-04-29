@@ -8,11 +8,12 @@ const { JWT } = require('google-auth-library');
 const app = express();
 app.use(express.json());
 
+// --- SERVER AWAKE FRONT DOOR ---
 app.get('/', (req, res) => {
     res.send('Server is awake!');
 });
 
-// 1. Setup Gemini with Secret Trigger Codes
+// 1. Setup Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const systemPrompt = `You are DeemWonder's customer support agent, act like a real human. ALWAYS keep replies under 2 sentences with minimal words. dont be rude. 
 Business Facts:
@@ -52,7 +53,7 @@ const serviceAccountAuth = new JWT({
 });
 const doc = new GoogleSpreadsheet(process.env.SHEET_ID, serviceAccountAuth);
 
-// 4. Background Batch Updater
+// 4. Background Batch Updater (No Overlaps)
 async function processSheetBatch() {
     if (pendingSheetUpdates.size > 0) {
         const updatesToProcess = new Map(pendingSheetUpdates);
@@ -89,17 +90,21 @@ async function processSheetBatch() {
             if (newCustomers.length > 0) {
                 await sheet.addRows(newCustomers);
             }
+
             console.log(`Successfully batch updated ${updatesToProcess.size} records.`);
+
         } catch (err) {
             console.error("Google Sheets Batch Error:", err.message);
             updatesToProcess.forEach((value, key) => pendingSheetUpdates.set(key, value));
         }
     }
+    // Wait 15 seconds AFTER finishing before running again
     setTimeout(processSheetBatch, 15000);
 }
+// Start the loop
 setTimeout(processSheetBatch, 15000);
 
-// Helper: Send Text Message
+// Helper: Send WhatsApp Message
 async function sendWhatsAppMessage(phone, text) {
     await axios({
         method: 'POST',
@@ -127,6 +132,7 @@ async function sendProductMessage(phone, catalogId, contentId) {
             type: 'interactive',
             interactive: {
                 type: 'product',
+                body: { text: "Tap to view product details and pictures:" },
                 action: {
                     catalog_id: catalogId,
                     product_item_retailer_id: contentId
@@ -136,7 +142,7 @@ async function sendProductMessage(phone, catalogId, contentId) {
     });
 }
 
-// Helper: Process the glued message
+// Helper: Process the final/glued message
 async function processFinalMessage(senderPhone, finalUserText) {
     const today = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
     
@@ -199,7 +205,7 @@ async function processFinalMessage(senderPhone, finalUserText) {
         aiReply = "Give me just a second and try again!";
     }
 
-    // --- NEW: PRODUCT INTERCEPTOR ---
+    // --- PRODUCT INTERCEPTOR ---
     let productToSend = null;
     const catalogID = '1276433380786865';
 
@@ -219,7 +225,12 @@ async function processFinalMessage(senderPhone, finalUserText) {
 
     // Send the catalog product right after if triggered
     if (productToSend) {
-        await sendProductMessage(senderPhone, catalogID, productToSend);
+        try {
+            await sendProductMessage(senderPhone, catalogID, productToSend);
+        } catch (prodErr) {
+            // This will print Meta's exact reason for failing
+            console.error("Meta Product Error:", prodErr.response ? JSON.stringify(prodErr.response.data) : prodErr.message);
+        }
     }
 
     const timer = setTimeout(() => {
@@ -271,25 +282,32 @@ app.post('/webhook', async (req, res) => {
                 return; 
             }
 
-            if (!messageBuffer.has(senderPhone)) {
-                messageBuffer.set(senderPhone, { text: userText, timer: null });
+            // --- HYBRID WAITING ROOM ---
+            if (chatMemory.has(senderPhone)) {
+                // Active chat: Skip delay completely
+                await processFinalMessage(senderPhone, userText);
             } else {
-                const current = messageBuffer.get(senderPhone);
-                current.text += " " + userText; 
-                clearTimeout(current.timer);
-            }
-
-            const currentBuffer = messageBuffer.get(senderPhone);
-            currentBuffer.timer = setTimeout(async () => {
-                try {
-                    const finalMessage = currentBuffer.text;
-                    messageBuffer.delete(senderPhone); 
-                    console.log(`Sending glued message to AI: ${finalMessage}`);
-                    await processFinalMessage(senderPhone, finalMessage);
-                } catch (err) {
-                    console.error("Buffer error:", err.message);
+                // Brand new chat: Use 3-second delay to catch fast double-texts
+                if (!messageBuffer.has(senderPhone)) {
+                    messageBuffer.set(senderPhone, { text: userText, timer: null });
+                } else {
+                    const current = messageBuffer.get(senderPhone);
+                    current.text += " " + userText; 
+                    clearTimeout(current.timer);
                 }
-            }, 3000);
+
+                const currentBuffer = messageBuffer.get(senderPhone);
+                currentBuffer.timer = setTimeout(async () => {
+                    try {
+                        const finalMessage = currentBuffer.text;
+                        messageBuffer.delete(senderPhone); 
+                        console.log(`Sending glued message to AI: ${finalMessage}`);
+                        await processFinalMessage(senderPhone, finalMessage);
+                    } catch (err) {
+                        console.error("Buffer error:", err.message);
+                    }
+                }, 3000);
+            }
         }
     } catch (error) {
         console.error("Webhook error:", error?.message);
