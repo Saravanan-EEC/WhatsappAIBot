@@ -135,7 +135,7 @@ async function sendProductMessage(phone, catalogId, contentId) {
                 body: { text: "Tap to view product details and pictures:" },
                 action: {
                     catalog_id: catalogId,
-                    product_item_retailer_id: contentId
+                    product_retailer_id: contentId // <--- FIXED THIS LINE
                 }
             }
         }
