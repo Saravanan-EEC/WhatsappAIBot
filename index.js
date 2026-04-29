@@ -8,19 +8,25 @@ const { JWT } = require('google-auth-library');
 const app = express();
 app.use(express.json());
 
-// --- SERVER AWAKE FRONT DOOR ---
 app.get('/', (req, res) => {
     res.send('Server is awake!');
 });
 
-// 1. Setup Gemini
+// 1. Setup Gemini with Secret Trigger Codes
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const systemPrompt = `You are DeemWonder's customer support bot. ALWAYS keep replies under 2 sentences. 
+const systemPrompt = `You are DeemWonder's customer support agent, act like a real human. ALWAYS keep replies under 2 sentences with minimal words. dont be rude. 
 Business Facts:
 - We sell customized gifts across India.
 - LED Moon Lamp: ₹699 (MRP ₹999). Free Delivery.
 - Magic Mirror: ₹499 (MRP ₹999).
-- Support Email: support@deemwonder.com`;
+- LED Photo Lamp: ₹1250 (MRP ₹1800)
+- Support Email: support@deemwonder.com
+
+CRITICAL INSTRUCTION: 
+If the customer asks to see or buy a specific product, answer them normally, but you MUST add exactly one of these secret codes at the very end of your reply:
+- For Magic Mirror: [SEND_MAGIC_MIRROR]
+- For Moon Lamp: [SEND_MOON_LAMP]
+- For Photo Lamp: [SEND_PHOTO_LAMP]`;
 
 const model = genAI.getGenerativeModel({ 
     model: "gemini-3.1-flash-lite-preview", 
@@ -46,7 +52,7 @@ const serviceAccountAuth = new JWT({
 });
 const doc = new GoogleSpreadsheet(process.env.SHEET_ID, serviceAccountAuth);
 
-// 4. Background Batch Updater (No Overlaps)
+// 4. Background Batch Updater
 async function processSheetBatch() {
     if (pendingSheetUpdates.size > 0) {
         const updatesToProcess = new Map(pendingSheetUpdates);
@@ -83,21 +89,17 @@ async function processSheetBatch() {
             if (newCustomers.length > 0) {
                 await sheet.addRows(newCustomers);
             }
-
             console.log(`Successfully batch updated ${updatesToProcess.size} records.`);
-
         } catch (err) {
             console.error("Google Sheets Batch Error:", err.message);
             updatesToProcess.forEach((value, key) => pendingSheetUpdates.set(key, value));
         }
     }
-    // Wait 15 seconds AFTER finishing before running again
     setTimeout(processSheetBatch, 15000);
 }
-// Start the loop
 setTimeout(processSheetBatch, 15000);
 
-// Helper: Send WhatsApp Message
+// Helper: Send Text Message
 async function sendWhatsAppMessage(phone, text) {
     await axios({
         method: 'POST',
@@ -107,6 +109,30 @@ async function sendWhatsAppMessage(phone, text) {
             'Content-Type': 'application/json'
         },
         data: { messaging_product: 'whatsapp', to: phone, text: { body: text } }
+    });
+}
+
+// Helper: Send Interactive Catalog Product
+async function sendProductMessage(phone, catalogId, contentId) {
+    await axios({
+        method: 'POST',
+        url: `https://graph.facebook.com/v25.0/${process.env.META_PHONE_ID}/messages`,
+        headers: {
+            'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
+            'Content-Type': 'application/json'
+        },
+        data: {
+            messaging_product: 'whatsapp',
+            to: phone,
+            type: 'interactive',
+            interactive: {
+                type: 'product',
+                action: {
+                    catalog_id: catalogId,
+                    product_item_retailer_id: contentId
+                }
+            }
+        }
     });
 }
 
@@ -173,14 +199,35 @@ async function processFinalMessage(senderPhone, finalUserText) {
         aiReply = "Give me just a second and try again!";
     }
 
+    // --- NEW: PRODUCT INTERCEPTOR ---
+    let productToSend = null;
+    const catalogID = '1276433380786865';
+
+    if (aiReply.includes('[SEND_MAGIC_MIRROR]')) {
+        productToSend = 'kgvvw73wvx';
+        aiReply = aiReply.replace('[SEND_MAGIC_MIRROR]', '').trim();
+    } else if (aiReply.includes('[SEND_MOON_LAMP]')) {
+        productToSend = 'gwyc5286y5';
+        aiReply = aiReply.replace('[SEND_MOON_LAMP]', '').trim();
+    } else if (aiReply.includes('[SEND_PHOTO_LAMP]')) {
+        productToSend = '1qpfyatk1u';
+        aiReply = aiReply.replace('[SEND_PHOTO_LAMP]', '').trim();
+    }
+
+    // Send the clean text first
+    await sendWhatsAppMessage(senderPhone, aiReply);
+
+    // Send the catalog product right after if triggered
+    if (productToSend) {
+        await sendProductMessage(senderPhone, catalogID, productToSend);
+    }
+
     const timer = setTimeout(() => {
         chatMemory.delete(senderPhone);
         memoryTimers.delete(senderPhone);
         spamTracker.delete(senderPhone);
     }, 30 * 60 * 1000);
     memoryTimers.set(senderPhone, timer);
-
-    await sendWhatsAppMessage(senderPhone, aiReply);
 }
 
 // 5. Meta Webhook Verification
@@ -224,7 +271,6 @@ app.post('/webhook', async (req, res) => {
                 return; 
             }
 
-            // --- 3 SECOND WAITING ROOM ---
             if (!messageBuffer.has(senderPhone)) {
                 messageBuffer.set(senderPhone, { text: userText, timer: null });
             } else {
@@ -235,7 +281,6 @@ app.post('/webhook', async (req, res) => {
 
             const currentBuffer = messageBuffer.get(senderPhone);
             currentBuffer.timer = setTimeout(async () => {
-                // ADDED TRY/CATCH TO PREVENT CRASHES
                 try {
                     const finalMessage = currentBuffer.text;
                     messageBuffer.delete(senderPhone); 
@@ -245,7 +290,6 @@ app.post('/webhook', async (req, res) => {
                     console.error("Buffer error:", err.message);
                 }
             }, 3000);
-            
         }
     } catch (error) {
         console.error("Webhook error:", error?.message);
